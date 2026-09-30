@@ -3,13 +3,13 @@
 // Remove tags from notes via right-click.
 // =====================================================================
 
-const { Plugin, PluginSettingTab, Setting, Notice, Modal } = require('obsidian');
+const { Plugin, PluginSettingTab, Setting, Notice, Modal, AbstractInputSuggest } = require('obsidian');
 
 // --- Constants ---
 const PLUGIN_ID = 'strip-hashtags';
 const PLUGIN_NAME = 'Strip Hashtags';
 const PLUGIN_VERSION = '0.1.0';
-const DEFAULT_SETTINGS = {};
+const DEFAULT_SETTINGS = { watchedDirs: [] };
 
 // --- Logger ---
 function log(...args)  { console.log(`[${PLUGIN_ID}]`, ...args); }
@@ -62,6 +62,35 @@ function isHexColor(token) {
       || /^[0-9a-fA-F]{8}$/.test(token);
 }
 
+/**
+ * Find the enabled watch entry that covers a file path (recursive prefix match).
+ *
+ * @param {string} filePath - vault-relative path of the file
+ * @param {Array<{path: string, enabled?: boolean}>} watchedDirs - the watch list
+ * @returns {object|null} the matching entry, or null if the file isn't watched
+ */
+function isWatched(filePath, watchedDirs) {
+  const p = filePath.replace(/\\/g, '/');
+  return (watchedDirs || []).find(d => {
+    if (!d || d.enabled === false) return false;
+    const dir = String(d.path || '').replace(/\/+$/, '');
+    return dir !== '' && p.startsWith(dir + '/');
+  }) || null;
+}
+
+/**
+ * Filter vault folder paths by a case-insensitive query (for the combobox).
+ *
+ * @param {string[]} folders - vault folder paths
+ * @param {string} query - the user's typed filter
+ * @returns {string[]} matching folders (all of them when the query is empty)
+ */
+function filterFolders(folders, query) {
+  const q = (query || '').trim().toLowerCase();
+  if (!q) return folders.slice();
+  return folders.filter(f => f.toLowerCase().includes(q));
+}
+
 // --- Notice helper ---
 const notice = {
   success(msg) { new Notice(`\u2713 ${msg}`, 4000); },
@@ -92,14 +121,74 @@ class ConfirmModal extends Modal {
   }
 }
 
-// --- Settings tab (dormant - phase 2) ---
+// --- Settings tab ---
+class FolderSuggest extends AbstractInputSuggest {
+  constructor(app, inputEl, folders, onSelect) {
+    super(app, inputEl);
+    this._folders = folders;
+    this._onSelect = onSelect;
+  }
+  getSuggestions(query) { return filterFolders(this._folders, query); }
+  renderSuggestion(value, el) { el.setText(value); }
+  selectSuggestion(value) { this._onSelect(value); this.close(); }
+}
+
 class StripHashtagsSettingTab extends PluginSettingTab {
   constructor(app, plugin) { super(app, plugin); this.plugin = plugin; }
+
   display() {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl('h2', { text: PLUGIN_NAME });
-    containerEl.createEl('p', { text: 'Directory-watcher settings will live here (phase 2).' });
+    containerEl.createEl('p', {
+      text: 'Automatically strip tags from new files that land in watched folders (subfolders included).',
+    });
+
+    containerEl.createEl('h3', { text: 'Watched folders' });
+    const dirs = this.plugin.settings.watchedDirs || [];
+    if (dirs.length === 0) {
+      containerEl.createEl('p', { text: 'None yet — add one below.', cls: 'setting-item-description' });
+    }
+    for (const entry of dirs) {
+      new Setting(containerEl)
+        .setName(entry.path)
+        .addToggle((t) =>
+          t.setValue(entry.enabled !== false).onChange(async (v) => {
+            entry.enabled = v;
+            await this.plugin.saveSettings();
+          })
+        )
+        .addExtraButton((b) =>
+          b.setIcon('trash').setTooltip('Remove').onClick(async () => {
+            this.plugin.settings.watchedDirs = dirs.filter((d) => d !== entry);
+            await this.plugin.saveSettings();
+            this.display();
+          })
+        );
+    }
+
+    new Setting(containerEl)
+      .setName('Add a folder')
+      .setDesc('Type to filter, then pick a folder to watch.')
+      .addText((text) => {
+        text.setPlaceholder('Search folders…');
+        new FolderSuggest(this.app, text.inputEl, this._allFolders(), (path) => {
+          if (!this.plugin.settings.watchedDirs.some((d) => d.path === path)) {
+            this.plugin.settings.watchedDirs.push({ path, enabled: true });
+            this.plugin.saveSettings();
+          }
+          text.setValue('');
+          this.display();
+        });
+      });
+  }
+
+  _allFolders() {
+    const folders = [];
+    this.app.vault.getAllLoadedFiles().forEach((f) => {
+      if (f && Array.isArray(f.children)) folders.push(f.path);
+    });
+    return folders.sort();
   }
 }
 
@@ -118,8 +207,57 @@ class StripHashtagsPlugin extends Plugin {
       })
     );
 
+    // --- Directory watcher ---
+    //
+    // Strips tags from files that land in watched folders. Listens to three events:
+    //   - 'create' — a new note (e.g. the Web Clipper creating the file)
+    //   - 'rename' — a note moved INTO a watched folder
+    //   - 'modify' — needed because the Web Clipper writes a note in stages: it
+    //               creates the file, adds a template, THEN fills in the body
+    //               (where the tags live). Those later writes fire as 'modify',
+    //               so we re-strip within a short window after arrival.
+    //
+    // `_arrived` records when a file first arrived (create/rename); `_onModify`
+    // only re-strips within 15s of that, so the user's own later edits are never
+    // touched. `_stripping` guards against re-entry (our own `vault.modify` also
+    // fires 'modify', which would otherwise loop).
+    this._stripping = new Set();
+    this._arrived = new Map(); // file path -> arrival timestamp (ms)
+    this.registerEvent(this.app.vault.on('create', (file) => this._onArrival(file)));
+    this.registerEvent(this.app.vault.on('rename', (file) => this._onArrival(file)));
+    this.registerEvent(this.app.vault.on('modify', (file) => this._onModify(file)));
+
     this.addSettingTab(new StripHashtagsSettingTab(this.app, this));
     log('ready');
+  }
+
+  /** A file just arrived (created or moved) in a watched folder. */
+  _onArrival(file) {
+    if (!file || file.extension !== 'md') return;
+    if (!isWatched(file.path, this.settings.watchedDirs)) return;
+    this._arrived.set(file.path, Date.now());
+    this._stripGuarded(file);
+  }
+
+  /**
+   * A watched file changed. Re-strips only shortly after arrival — this catches
+   * the Web Clipper's staged write (create → template → fill) without touching
+   * the user's own edits made later than 15s after the file arrived.
+   */
+  _onModify(file) {
+    if (!file || file.extension !== 'md') return;
+    if (!isWatched(file.path, this.settings.watchedDirs)) return;
+    const arrived = this._arrived.get(file.path);
+    if (!arrived || Date.now() - arrived > 15000) return; // ignore edits long after arrival
+    this._stripGuarded(file);
+  }
+
+  /** Strip a watched file once, guarded against re-entry. */
+  async _stripGuarded(file) {
+    if (this._stripping.has(file.path)) return;
+    this._stripping.add(file.path);
+    try { await this._stripFiles([file]); }
+    finally { this._stripping.delete(file.path); }
   }
 
   /** Strip for a right-clicked target (a note, a multi-selection, or a folder). */
@@ -162,8 +300,12 @@ class StripHashtagsPlugin extends Plugin {
     notice.success(`Stripped tags from ${count} file${count === 1 ? '' : 's'}.`);
   }
 
+  async saveSettings() { await this.saveData(this.settings); }
+
   onunload() { log('unloaded'); }
 }
 
 module.exports = StripHashtagsPlugin;
-module.exports.stripTags = stripTags;  // exposed for the test harness
+module.exports.stripTags = stripTags;          // exposed for the test harness
+module.exports.isWatched = isWatched;
+module.exports.filterFolders = filterFolders;
