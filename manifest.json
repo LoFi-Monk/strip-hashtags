@@ -1,0 +1,8 @@
+{
+  "id": "strip-hashtags",
+  "name": "Strip Hashtags",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "author": "LoFi Monk",
+  "description": "Remove hashtags from notes via right-click — strips inline tags and frontmatter tags."
+}
