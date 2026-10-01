@@ -9,7 +9,7 @@ const { Plugin, PluginSettingTab, Setting, Notice, Modal, AbstractInputSuggest }
 const PLUGIN_ID = 'strip-hashtags';
 const PLUGIN_NAME = 'Strip Hashtags';
 const PLUGIN_VERSION = '0.1.0';
-const DEFAULT_SETTINGS = { watchedDirs: [] };
+const DEFAULT_SETTINGS = { watchedDirs: [], mode: 'both' }; // mode: 'both' | 'inline'
 
 // --- Logger ---
 function log(...args)  { console.log(`[${PLUGIN_ID}]`, ...args); }
@@ -20,25 +20,33 @@ function err(...args)  { console.error(`[${PLUGIN_ID}]`, ...args); }
 /**
  * Strip tags from markdown text.
  *
- * Removes *real* tags only (`#` + letters/digits/`_`/`-`/`/`), skipping headings,
- * code blocks / inline code, URLs, and hex colors. Also empties the frontmatter
- * `tags:` value while leaving the key behind.
+ * Removes *real* tags only, skipping headings, code blocks / inline code, URLs,
+ * and hex colors. Tag chars are Unicode-aware (letters, digits, emoji/symbols,
+ * `_` `-` `/`). Also empties the frontmatter `tags:` value while leaving the key
+ * behind — unless `inlineOnly` is set, in which case the frontmatter is untouched.
  *
  * Pure — no Obsidian dependency, so it can be unit-tested directly.
  *
  * @param {string} text - the full markdown source of a note
+ * @param {{inlineOnly?: boolean}} [opts] - `inlineOnly` skips frontmatter stripping
  * @returns {string} the text with tags removed
  */
-function stripTags(text) {
-  return stripFrontmatterTags(text)
-    // Remove inline tags, leaving fenced + inline code untouched.
-    .replace(/(```[\s\S]*?```|`[^`]*`)|(?<![\w/])#([A-Za-z0-9_/-]+)/g, (m, code, tag) => {
+function stripTags(text, opts = {}) {
+  const { inlineOnly = false } = opts;
+  let out = inlineOnly ? text : stripFrontmatterTags(text);
+  let removed = false;
+  out = out.replace(
+    /(```[\s\S]*?```|`[^`]*`)|(?<![\p{L}\p{N}_/])#([\p{L}\p{N}\p{So}_/-]+)/gu,
+    (m, code, tag) => {
       if (code !== undefined) return code; // code block / inline code — leave as-is
       if (isHexColor(tag)) return m;        // hex colour, not a tag
+      removed = true;
       return '';                            // drop the tag
-    })
-    // Collapse the double space a removed tag leaves behind.
-    .replace(/[ \t]{2,}/g, ' ');
+    }
+  );
+  // Only collapse double-spaces if we actually removed an inline tag — otherwise
+  // leave pre-existing formatting alone.
+  return removed ? out.replace(/[ \t]{2,}/g, ' ') : out;
 }
 
 /**
@@ -144,6 +152,20 @@ class StripHashtagsSettingTab extends PluginSettingTab {
       text: 'Automatically strip tags from new files that land in watched folders (subfolders included).',
     });
 
+    new Setting(containerEl)
+      .setName('Strip mode')
+      .setDesc('Both inline + frontmatter, or inline tags only.')
+      .addDropdown((d) =>
+        d
+          .addOption('both', 'Both (inline + frontmatter)')
+          .addOption('inline', 'Inline only')
+          .setValue(this.plugin.settings.mode || 'both')
+          .onChange(async (v) => {
+            this.plugin.settings.mode = v;
+            await this.plugin.saveSettings();
+          })
+      );
+
     containerEl.createEl('h3', { text: 'Watched folders' });
     const dirs = this.plugin.settings.watchedDirs || [];
     if (dirs.length === 0) {
@@ -227,6 +249,15 @@ class StripHashtagsPlugin extends Plugin {
     this.registerEvent(this.app.vault.on('rename', (file) => this._onArrival(file)));
     this.registerEvent(this.app.vault.on('modify', (file) => this._onModify(file)));
 
+    this.addCommand({
+      id: 'strip-active-note',
+      name: 'Strip hashtags on current note',
+      callback: () => {
+        const f = this.app.workspace.getActiveFile();
+        if (f) this._stripFiles([f]);
+      },
+    });
+
     this.addSettingTab(new StripHashtagsSettingTab(this.app, this));
     log('ready');
   }
@@ -276,10 +307,20 @@ class StripHashtagsPlugin extends Plugin {
   /** Collect the `.md` files a target expands to. */
   _collect(target) {
     if (Array.isArray(target.children)) {
-      return target.children.filter(f => f.extension === 'md'); // folder — direct .md only
+      const files = [];
+      this._folderFiles(target, files); // recursive — .md at any depth
+      return files;
     }
     const selected = this._selected();
     return selected.length > 1 ? selected : [target];
+  }
+
+  /** Walk a folder recursively, collecting `.md` files. */
+  _folderFiles(folder, out) {
+    for (const child of folder.children) {
+      if (Array.isArray(child.children)) this._folderFiles(child, out);
+      else if (child.extension === 'md') out.push(child);
+    }
   }
 
   /** Selected files in the file explorer (for multi-select right-clicks). */
@@ -294,10 +335,17 @@ class StripHashtagsPlugin extends Plugin {
     let count = 0;
     for (const f of files) {
       const text = await this.app.vault.read(f);
-      const out = stripTags(text);
+      const out = stripTags(text, { inlineOnly: this.settings.mode === 'inline' });
       if (out !== text) { await this.app.vault.modify(f, out); count++; }
     }
     notice.success(`Stripped tags from ${count} file${count === 1 ? '' : 's'}.`);
+  }
+
+  /** Strip a single file by vault path (no modal) — usable by the agent via `eval`. */
+  async stripPath(path) {
+    const f = this.app.vault.getAbstractFileByPath(path);
+    if (!f || f.extension !== 'md') { warn('stripPath: no markdown file at', path); return; }
+    await this._stripFiles([f]);
   }
 
   async saveSettings() { await this.saveData(this.settings); }

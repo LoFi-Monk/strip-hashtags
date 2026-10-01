@@ -66,3 +66,25 @@ test('leaves tag: and Tags: alone', () => {
   const src = '---\ntag: [a]\nTags: [b]\n---\nbody';
   assert.strictEqual(stripTags(src), src);
 });
+
+// --- Phase 3: bug fixes + features ---
+test('removes a non-ASCII tag (Arabic)', () => {
+  assert.strictEqual(stripTags('hello #موزريلا world'), 'hello world');
+});
+
+test('removes a non-ASCII tag (CJK)', () => {
+  assert.strictEqual(stripTags('see #オープンまで now'), 'see now');
+});
+
+test('removes an emoji tag', () => {
+  assert.strictEqual(stripTags('fun #🥰🥰🥰 times'), 'fun times');
+});
+
+test('does not collapse pre-existing double spaces when no tag is removed', () => {
+  assert.strictEqual(stripTags('no tags  here'), 'no tags  here');
+});
+
+test('inline-only mode leaves frontmatter tags alone', () => {
+  const src = '---\ntags: [keep, me]\n---\nhello #tag world';
+  assert.strictEqual(stripTags(src, { inlineOnly: true }), '---\ntags: [keep, me]\n---\nhello world');
+});
