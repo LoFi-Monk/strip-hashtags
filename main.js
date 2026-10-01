@@ -35,6 +35,9 @@ function stripTags(text, opts = {}) {
   const { inlineOnly = false } = opts;
   let out = inlineOnly ? text : stripFrontmatterTags(text);
   let removed = false;
+  // One pass, two alternatives: (1) a fenced/inline code block — keep it intact;
+  // (2) a real tag (`#` + letters/digits/emoji/`_`/`-`/`/`) — drop it unless it's a
+  // hex colour. The lookbehind stops us matching URL fragments (`page#frag`).
   out = out.replace(
     /(```[\s\S]*?```|`[^`]*`)|(?<![\p{L}\p{N}_/])#([\p{L}\p{N}\p{So}_/-]+)/gu,
     (m, code, tag) => {
@@ -108,6 +111,7 @@ const notice = {
 };
 
 // --- Confirmation modal ---
+/** Cancel/Confirm dialog — used to confirm multi-file strips. */
 class ConfirmModal extends Modal {
   constructor(app, title, message, onConfirm) {
     super(app);
@@ -130,6 +134,7 @@ class ConfirmModal extends Modal {
 }
 
 // --- Settings tab ---
+/** Searchable folder picker (combobox) for choosing a folder to watch. */
 class FolderSuggest extends AbstractInputSuggest {
   constructor(app, inputEl, folders, onSelect) {
     super(app, inputEl);
@@ -141,6 +146,7 @@ class FolderSuggest extends AbstractInputSuggest {
   selectSuggestion(value) { this._onSelect(value); this.close(); }
 }
 
+/** The settings tab: strip mode + the watched-folders list. */
 class StripHashtagsSettingTab extends PluginSettingTab {
   constructor(app, plugin) { super(app, plugin); this.plugin = plugin; }
 
@@ -205,6 +211,7 @@ class StripHashtagsSettingTab extends PluginSettingTab {
       });
   }
 
+  /** All folder paths in the vault, sorted (the combobox's suggestion pool). */
   _allFolders() {
     const folders = [];
     this.app.vault.getAllLoadedFiles().forEach((f) => {
